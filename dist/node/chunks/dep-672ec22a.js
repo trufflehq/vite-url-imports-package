@@ -49648,7 +49648,7 @@ async function instantiateModule(url, server, context = { global }, urlStack = [
         var _a, _b;
         // allow url imports (node 18 experimental)
         if (dep.startsWith('https:')) {
-            return (function (t) { return Promise.resolve().then(function () { return /*#__PURE__*/_interopNamespace(require(t)); }); })(dep);
+          return import(dep)
         }
         else if (dep[0] !== '.' && dep[0] !== '/') {
             return nodeImport(dep, mod.file, resolveOptions);
