@@ -1,5 +1,5 @@
-import fs from 'fs'
-import path from 'path'
+import fs from 'node:fs'
+import path from 'node:path'
 import colors from 'picocolors'
 import type { PartialResolvedId } from 'rollup'
 import { resolve as _resolveExports } from 'resolve.exports'
@@ -24,22 +24,19 @@ import {
   isDataUrl,
   isExternalUrl,
   isFileReadable,
+  isNonDriveRelativeAbsolutePath,
   isObject,
   isPossibleTsOutput,
   isTsRequest,
+  isWindows,
   nestedResolveFrom,
   normalizePath,
   resolveFrom,
   slash
 } from '../utils'
-import {
-  createIsOptimizedDepUrl,
-  isOptimizedDepFile,
-  optimizedDepInfoFromFile,
-  optimizedDepInfoFromId
-} from '../optimizer'
-import type { OptimizedDepInfo } from '../optimizer'
-import type { SSROptions, ViteDevServer } from '..'
+import { optimizedDepInfoFromFile, optimizedDepInfoFromId } from '../optimizer'
+import type { DepsOptimizer } from '../optimizer'
+import type { SSROptions } from '..'
 import type { PackageCache, PackageData } from '../packages'
 import { loadPackageData, resolvePackageData } from '../packages'
 
@@ -86,31 +83,34 @@ export interface InternalResolveOptions extends ResolveOptions {
   tryEsmOnly?: boolean
   // True when resolving during the scan phase to discover dependencies
   scan?: boolean
+  // Appends ?__vite_skip_optimization to the resolved id if shouldn't be optimized
+  ssrOptimizeCheck?: boolean
+  // Resolve using esbuild deps optimization
+  getDepsOptimizer?: (ssr: boolean) => DepsOptimizer | undefined
+  shouldExternalize?: (id: string) => boolean | undefined
 }
 
-export function resolvePlugin(baseOptions: InternalResolveOptions): Plugin {
+export function resolvePlugin(resolveOptions: InternalResolveOptions): Plugin {
   const {
     root,
     isProduction,
     asSrc,
     ssrConfig,
     preferRelative = false
-  } = baseOptions
-  let server: ViteDevServer | undefined
-  let isOptimizedDepUrl: (url: string) => boolean
+  } = resolveOptions
 
   const { target: ssrTarget, noExternal: ssrNoExternal } = ssrConfig ?? {}
 
   return {
     name: 'vite:resolve',
 
-    configureServer(_server) {
-      server = _server
-      isOptimizedDepUrl = createIsOptimizedDepUrl(server.config)
-    },
-
     async resolveId(id, importer, resolveOpts) {
       const ssr = resolveOpts?.ssr === true
+
+      // We need to delay depsOptimizer until here instead of passing it as an option
+      // the resolvePlugin because the optimizer is created on server listen during dev
+      const depsOptimizer = resolveOptions.getDepsOptimizer?.(ssr)
+
       if (id.startsWith(browserExternalId)) {
         return id
       }
@@ -128,12 +128,15 @@ export function resolvePlugin(baseOptions: InternalResolveOptions): Plugin {
 
       const options: InternalResolveOptions = {
         isRequire,
-        ...baseOptions,
-        scan: resolveOpts?.scan ?? baseOptions.scan
+        ...resolveOptions,
+        scan: resolveOpts?.scan ?? resolveOptions.scan
       }
 
       if (importer) {
-        if (isTsRequest(importer)) {
+        if (
+          isTsRequest(importer) ||
+          resolveOpts.custom?.depScan?.loader?.startsWith('ts')
+        ) {
           options.isFromTsImporter = true
         } else {
           const moduleLang = this.getModuleInfo(importer)?.meta?.vite?.lang
@@ -146,7 +149,7 @@ export function resolvePlugin(baseOptions: InternalResolveOptions): Plugin {
       // resolve pre-bundled deps requests, these could be resolved by
       // tryFileResolve or /fs/ resolution but these files may not yet
       // exists if we are in the middle of a deps re-processing
-      if (asSrc && isOptimizedDepUrl?.(id)) {
+      if (asSrc && depsOptimizer?.isOptimizedDepUrl(id)) {
         const optimizedPath = id.startsWith(FS_PREFIX)
           ? fsPathFromId(id)
           : normalizePath(ensureVolumeInPath(path.resolve(root, id.slice(1))))
@@ -174,22 +177,22 @@ export function resolvePlugin(baseOptions: InternalResolveOptions): Plugin {
       }
 
       // relative
-      if (id.startsWith('.') || (preferRelative && /^\w/.test(id))) {
+      if (
+        id.startsWith('.') ||
+        ((preferRelative || importer?.endsWith('.html')) && /^\w/.test(id))
+      ) {
         const basedir = importer ? path.dirname(importer) : process.cwd()
         const fsPath = path.resolve(basedir, id)
         // handle browser field mapping for relative imports
 
         const normalizedFsPath = normalizePath(fsPath)
 
-        if (
-          server?._optimizedDeps &&
-          isOptimizedDepFile(normalizedFsPath, server!.config)
-        ) {
+        if (depsOptimizer?.isOptimizedDepFile(normalizedFsPath)) {
           // Optimized files could not yet exist in disk, resolve to the full path
           // Inject the current browserHash version if the path doesn't have one
           if (!normalizedFsPath.match(DEP_VERSION_RE)) {
             const browserHash = optimizedDepInfoFromFile(
-              server._optimizedDeps!.metadata!,
+              depsOptimizer.metadata,
               normalizedFsPath
             )?.browserHash
             if (browserHash) {
@@ -210,7 +213,7 @@ export function resolvePlugin(baseOptions: InternalResolveOptions): Plugin {
               importer,
               options,
               targetWeb,
-              server,
+              depsOptimizer,
               ssr
             )) &&
             res.id.startsWith(normalizedFsPath)
@@ -241,8 +244,22 @@ export function resolvePlugin(baseOptions: InternalResolveOptions): Plugin {
         }
       }
 
+      // drive relative fs paths (only windows)
+      if (isWindows && id.startsWith('/')) {
+        const basedir = importer ? path.dirname(importer) : process.cwd()
+        const fsPath = path.resolve(basedir, id)
+        if ((res = tryFsResolve(fsPath, options))) {
+          isDebug &&
+            debug(`[drive-relative] ${colors.cyan(id)} -> ${colors.dim(res)}`)
+          return res
+        }
+      }
+
       // absolute fs paths
-      if (path.isAbsolute(id) && (res = tryFsResolve(id, options))) {
+      if (
+        isNonDriveRelativeAbsolutePath(id) &&
+        (res = tryFsResolve(id, options))
+      ) {
         isDebug && debug(`[fs] ${colors.cyan(id)} -> ${colors.dim(res)}`)
         return res
       }
@@ -263,25 +280,40 @@ export function resolvePlugin(baseOptions: InternalResolveOptions): Plugin {
 
       // bare package imports, perform node resolve
       if (bareImportRE.test(id)) {
+        const external = options.shouldExternalize?.(id)
         if (
+          !external &&
           asSrc &&
-          server &&
-          !ssr &&
+          depsOptimizer &&
           !options.scan &&
-          (res = await tryOptimizedResolve(id, server, importer))
+          (res = await tryOptimizedResolve(depsOptimizer, id, importer))
         ) {
           return res
         }
 
         if (
           targetWeb &&
-          (res = tryResolveBrowserMapping(id, importer, options, false))
+          (res = tryResolveBrowserMapping(
+            id,
+            importer,
+            options,
+            false,
+            external
+          ))
         ) {
           return res
         }
 
         if (
-          (res = tryNodeResolve(id, importer, options, targetWeb, server, ssr))
+          (res = tryNodeResolve(
+            id,
+            importer,
+            options,
+            targetWeb,
+            depsOptimizer,
+            ssr,
+            external
+          ))
         ) {
           return res
         }
@@ -325,15 +357,17 @@ export function resolvePlugin(baseOptions: InternalResolveOptions): Plugin {
 
     load(id) {
       if (id.startsWith(browserExternalId)) {
-        return isProduction
-          ? `export default {}`
-          : `export default new Proxy({}, {
-  get() {
-    throw new Error('Module "${id.slice(
-      browserExternalId.length + 1
-    )}" has been externalized for browser compatibility and cannot be accessed in client code.')
+        if (isProduction) {
+          return `export default {}`
+        } else {
+          id = id.slice(browserExternalId.length + 1)
+          return `\
+export default new Proxy({}, {
+  get(_, key) {
+    throw new Error(\`Module "${id}" has been externalized for browser compatibility. Cannot access "${id}.\${key}" in client code.\`)
   }
 })`
+        }
       }
     }
   }
@@ -520,10 +554,13 @@ export function tryNodeResolve(
   importer: string | null | undefined,
   options: InternalResolveOptions,
   targetWeb: boolean,
-  server?: ViteDevServer,
-  ssr?: boolean
+  depsOptimizer?: DepsOptimizer,
+  ssr?: boolean,
+  externalize?: boolean
 ): PartialResolvedId | undefined {
   const { root, dedupe, isBuild, preserveSymlinks, packageCache } = options
+
+  ssr ??= false
 
   // split id by last '>' for nested selected packages, for example:
   // 'foo > bar > baz' => 'foo > bar' & 'baz'
@@ -589,7 +626,8 @@ export function tryNodeResolve(
 
   let resolveId = resolvePackageEntry
   let unresolvedId = pkgId
-  if (unresolvedId !== nestedPath) {
+  const isDeepImport = unresolvedId !== nestedPath
+  if (isDeepImport) {
     resolveId = resolveDeepImport
     unresolvedId = '.' + nestedPath.slice(pkgId.length)
   }
@@ -614,8 +652,98 @@ export function tryNodeResolve(
     return
   }
 
+  const processResult = (resolved: PartialResolvedId) => {
+    if (!externalize) {
+      return resolved
+    }
+    const resolvedExt = path.extname(resolved.id)
+    let resolvedId = id
+    if (isDeepImport) {
+      // check ext before externalizing - only externalize
+      // extension-less imports and explicit .js imports
+      if (resolvedExt && !resolved.id.match(/(.js|.mjs|.cjs)$/)) {
+        return
+      }
+      if (!pkg?.data.exports && path.extname(id) !== resolvedExt) {
+        resolvedId += resolvedExt
+      }
+    }
+    return { ...resolved, id: resolvedId, external: true }
+  }
+
   // link id to pkg for browser field mapping check
   idToPkgMap.set(resolved, pkg)
+  if ((isBuild && !depsOptimizer) || externalize) {
+    // Resolve package side effects for build so that rollup can better
+    // perform tree-shaking
+    return processResult({
+      id: resolved,
+      moduleSideEffects: pkg.hasSideEffects(resolved)
+    })
+  }
+
+  const ext = path.extname(resolved)
+  const isCJS = ext === '.cjs' || (ext === '.js' && pkg.data.type !== 'module')
+
+  if (
+    !options.ssrOptimizeCheck &&
+    (!resolved.includes('node_modules') || // linked
+      !depsOptimizer || // resolving before listening to the server
+      options.scan) // initial esbuild scan phase
+  ) {
+    return { id: resolved }
+  }
+
+  // if we reach here, it's a valid dep import that hasn't been optimized.
+  const isJsType = OPTIMIZABLE_ENTRY_RE.test(resolved)
+
+  let exclude = depsOptimizer?.options.exclude
+  let include = depsOptimizer?.options.exclude
+  if (options.ssrOptimizeCheck) {
+    // we don't have the depsOptimizer
+    exclude = options.ssrConfig?.optimizeDeps?.exclude
+    include = options.ssrConfig?.optimizeDeps?.exclude
+  }
+
+  const skipOptimization =
+    !isJsType ||
+    importer?.includes('node_modules') ||
+    exclude?.includes(pkgId) ||
+    exclude?.includes(nestedPath) ||
+    SPECIAL_QUERY_RE.test(resolved) ||
+    (!isBuild && ssr) ||
+    // Only optimize non-external CJS deps during SSR by default
+    (ssr &&
+      !isCJS &&
+      !(include?.includes(pkgId) || include?.includes(nestedPath)))
+
+  if (options.ssrOptimizeCheck) {
+    return {
+      id: skipOptimization
+        ? injectQuery(resolved, `__vite_skip_optimization`)
+        : resolved
+    }
+  }
+
+  if (skipOptimization) {
+    // excluded from optimization
+    // Inject a version query to npm deps so that the browser
+    // can cache it without re-validation, but only do so for known js types.
+    // otherwise we may introduce duplicated modules for externalized files
+    // from pre-bundled deps.
+    if (!isBuild) {
+      const versionHash = depsOptimizer!.metadata.browserHash
+      if (versionHash && isJsType) {
+        resolved = injectQuery(resolved, `v=${versionHash}`)
+      }
+    }
+  } else {
+    // this is a missing import, queue optimize-deps re-run and
+    // get a resolved its optimized info
+    const optimizedInfo = depsOptimizer!.registerMissingImport(id, resolved)
+    resolved = depsOptimizer!.getOptimizedDepId(optimizedInfo)
+  }
+
   if (isBuild) {
     // Resolve package side effects for build so that rollup can better
     // perform tree-shaking
@@ -624,65 +752,26 @@ export function tryNodeResolve(
       moduleSideEffects: pkg.hasSideEffects(resolved)
     }
   } else {
-    if (
-      !resolved.includes('node_modules') || // linked
-      !server || // build
-      !server._optimizedDeps || // resolving before listening to the server
-      options.scan // initial esbuild scan phase
-    ) {
-      return { id: resolved }
-    }
-    // if we reach here, it's a valid dep import that hasn't been optimized.
-    const isJsType = OPTIMIZABLE_ENTRY_RE.test(resolved)
-    const exclude = server.config.optimizeDeps?.exclude
-    if (
-      !isJsType ||
-      importer?.includes('node_modules') ||
-      exclude?.includes(pkgId) ||
-      exclude?.includes(nestedPath) ||
-      SPECIAL_QUERY_RE.test(resolved) ||
-      ssr
-    ) {
-      // excluded from optimization
-      // Inject a version query to npm deps so that the browser
-      // can cache it without re-validation, but only do so for known js types.
-      // otherwise we may introduce duplicated modules for externalized files
-      // from pre-bundled deps.
-
-      const versionHash = server._optimizedDeps!.metadata.browserHash
-      if (versionHash && isJsType) {
-        resolved = injectQuery(resolved, `v=${versionHash}`)
-      }
-    } else {
-      // this is a missing import, queue optimize-deps re-run and
-      // get a resolved its optimized info
-      const optimizedInfo = server._optimizedDeps!.registerMissingImport(
-        id,
-        resolved
-      )
-      resolved = getOptimizedUrl(optimizedInfo)
-    }
     return { id: resolved! }
   }
 }
 
-const getOptimizedUrl = (optimizedData: OptimizedDepInfo) =>
-  `${optimizedData.file}?v=${optimizedData.browserHash}`
-
 export async function tryOptimizedResolve(
+  depsOptimizer: DepsOptimizer,
   id: string,
-  server: ViteDevServer,
   importer?: string
 ): Promise<string | undefined> {
-  const optimizedDeps = server._optimizedDeps
+  // TODO: we need to wait until scanning is done here as this function
+  // is used in the preAliasPlugin to decide if an aliased dep is optimized,
+  // and avoid replacing the bare import with the resolved path.
+  // We should be able to remove this in the future
+  await depsOptimizer.scanProcessing
 
-  if (!optimizedDeps) return
+  const metadata = depsOptimizer.metadata
 
-  await optimizedDeps.scanProcessing
-
-  const depInfo = optimizedDepInfoFromId(optimizedDeps.metadata, id)
+  const depInfo = optimizedDepInfoFromId(metadata, id)
   if (depInfo) {
-    return getOptimizedUrl(depInfo)
+    return depsOptimizer.getOptimizedDepId(depInfo)
   }
 
   if (!importer) return
@@ -690,7 +779,7 @@ export async function tryOptimizedResolve(
   // further check if id is imported by nested dependency
   let resolvedSrc: string | undefined
 
-  for (const optimizedData of optimizedDeps.metadata.depInfoList) {
+  for (const optimizedData of metadata.depInfoList) {
     if (!optimizedData.src) continue // Ignore chunks
 
     const pkgPath = optimizedData.id
@@ -713,7 +802,7 @@ export async function tryOptimizedResolve(
 
     // match by src to correctly identify if id belongs to nested dependency
     if (optimizedData.src === resolvedSrc) {
-      return getOptimizedUrl(optimizedData)
+      return depsOptimizer.getOptimizedDepId(optimizedData)
     }
   }
 }
@@ -827,10 +916,10 @@ export function resolvePackageEntry(
         return resolvedEntryPoint
       }
     }
-    packageEntryFailure(id)
   } catch (e) {
     packageEntryFailure(id, e.message)
   }
+  packageEntryFailure(id)
 }
 
 function packageEntryFailure(id: string, details?: string) {
@@ -936,7 +1025,8 @@ function tryResolveBrowserMapping(
   id: string,
   importer: string | undefined,
   options: InternalResolveOptions,
-  isFilePath: boolean
+  isFilePath: boolean,
+  externalize?: boolean
 ) {
   let res: string | undefined
   const pkg = importer && idToPkgMap.get(importer)
@@ -949,10 +1039,11 @@ function tryResolveBrowserMapping(
         isDebug &&
           debug(`[browser mapped] ${colors.cyan(id)} -> ${colors.dim(res)}`)
         idToPkgMap.set(res, pkg)
-        return {
+        const result = {
           id: res,
           moduleSideEffects: pkg.hasSideEffects(res)
         }
+        return externalize ? { ...result, external: true } : result
       }
     } else if (browserMappedPath === false) {
       return browserExternalId

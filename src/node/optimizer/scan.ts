@@ -1,25 +1,19 @@
-import fs from 'fs'
-import path from 'path'
-import { performance } from 'perf_hooks'
+import fs from 'node:fs'
+import path from 'node:path'
+import { performance } from 'node:perf_hooks'
 import glob from 'fast-glob'
 import type { Loader, OnLoadResult, Plugin } from 'esbuild'
 import { build, transform } from 'esbuild'
-import { init, parse } from 'es-module-lexer'
-import MagicString from 'magic-string'
 import colors from 'picocolors'
-import type { Logger, ResolvedConfig } from '..'
-import {
-  JS_TYPES_RE,
-  KNOWN_ASSET_TYPES,
-  OPTIMIZABLE_ENTRY_RE,
-  SPECIAL_QUERY_RE
-} from '../constants'
+import type { ResolvedConfig } from '..'
+import { JS_TYPES_RE, KNOWN_ASSET_TYPES, SPECIAL_QUERY_RE } from '../constants'
 import {
   cleanUrl,
   createDebugger,
   dataUrlRE,
   externalRE,
   isObject,
+  isOptimizable,
   moduleListContains,
   multilineCommentsRE,
   normalizePath,
@@ -29,7 +23,9 @@ import {
 } from '../utils'
 import type { PluginContainer } from '../server/pluginContainer'
 import { createPluginContainer } from '../server/pluginContainer'
-import { transformImportGlob } from '../importGlob'
+import { transformGlobImport } from '../plugins/importMetaGlob'
+
+type ResolveIdOptions = Parameters<PluginContainer['resolveId']>[2]
 
 const debug = createDebugger('vite:deps')
 
@@ -50,6 +46,8 @@ export async function scanImports(config: ResolvedConfig): Promise<{
   deps: Record<string, string>
   missing: Record<string, string>
 }> {
+  // Only used to scan non-ssr code
+
   const start = performance.now()
 
   let entries: string[] = []
@@ -77,9 +75,7 @@ export async function scanImports(config: ResolvedConfig): Promise<{
   // Non-supported entry file types and virtual files should not be scanned for
   // dependencies.
   entries = entries.filter(
-    (entry) =>
-      (JS_TYPES_RE.test(entry) || htmlTypesRE.test(entry)) &&
-      fs.existsSync(entry)
+    (entry) => isScannable(entry) && fs.existsSync(entry)
   )
 
   if (!entries.length) {
@@ -169,7 +165,11 @@ function esbuildScanPlugin(
 ): Plugin {
   const seen = new Map<string, string | undefined>()
 
-  const resolve = async (id: string, importer?: string) => {
+  const resolve = async (
+    id: string,
+    importer?: string,
+    options?: ResolveIdOptions
+  ) => {
     const key = id + (importer && path.dirname(importer))
     if (seen.has(key)) {
       return seen.get(key)
@@ -178,6 +178,7 @@ function esbuildScanPlugin(
       id,
       importer && normalizePath(importer),
       {
+        ...options,
         scan: true
       }
     )
@@ -192,10 +193,6 @@ function esbuildScanPlugin(
     '@vite/client',
     '@vite/env'
   ]
-
-  const isOptimizable = (id: string) =>
-    OPTIMIZABLE_ENTRY_RE.test(id) ||
-    !!config.optimizeDeps.extensions?.some((ext) => id.endsWith(ext))
 
   const externalUnlessEntry = ({ path }: { path: string }) => ({
     path,
@@ -239,7 +236,11 @@ function esbuildScanPlugin(
         // It is possible for the scanner to scan html types in node_modules.
         // If we can optimize this html type, skip it so it's handled by the
         // bare import resolve, and recorded as optimization dep.
-        if (resolved.includes('node_modules') && isOptimizable(resolved)) return
+        if (
+          resolved.includes('node_modules') &&
+          isOptimizable(resolved, config.optimizeDeps)
+        )
+          return
         return {
           path: resolved,
           namespace: 'html'
@@ -302,24 +303,38 @@ function esbuildScanPlugin(
                 (loader.startsWith('ts') ? extractImportPaths(content) : '')
 
               const key = `${path}?id=${scriptId++}`
-
               if (contents.includes('import.meta.glob')) {
+                let transpiledContents
+                // transpile because `transformGlobImport` only expects js
+                if (loader !== 'js') {
+                  transpiledContents = (await transform(contents, { loader }))
+                    .code
+                } else {
+                  transpiledContents = contents
+                }
+
                 scripts[key] = {
-                  // transformGlob already transforms to js
-                  loader: 'js',
-                  contents: await transformGlob(
-                    contents,
-                    path,
-                    config.root,
-                    loader,
-                    resolve,
-                    config.logger
-                  )
+                  loader: 'js', // since it is transpiled
+                  contents:
+                    (
+                      await transformGlobImport(
+                        transpiledContents,
+                        path,
+                        config.root,
+                        resolve
+                      )
+                    )?.s.toString() || transpiledContents,
+                  pluginData: {
+                    htmlType: { loader }
+                  }
                 }
               } else {
                 scripts[key] = {
                   loader,
-                  contents
+                  contents,
+                  pluginData: {
+                    htmlType: { loader }
+                  }
                 }
               }
 
@@ -378,7 +393,7 @@ function esbuildScanPlugin(
             }
             if (resolved.includes('node_modules') || include?.includes(id)) {
               // dependency or forced included, externalize and stop crawling
-              if (isOptimizable(resolved)) {
+              if (isOptimizable(resolved, config.optimizeDeps)) {
                 depImports[id] = resolved
               }
               return externalUnlessEntry({ path: id })
@@ -432,9 +447,13 @@ function esbuildScanPlugin(
         {
           filter: /.*/
         },
-        async ({ path: id, importer }) => {
+        async ({ path: id, importer, pluginData }) => {
           // use vite resolver to support urls and omitted extensions
-          const resolved = await resolve(id, importer)
+          const resolved = await resolve(id, importer, {
+            custom: {
+              depScan: { loader: pluginData?.htmlType?.loader }
+            }
+          })
           if (resolved) {
             if (shouldExternalizeDep(resolved, id) || !isScannable(resolved)) {
               return externalUnlessEntry({ path: id })
@@ -469,20 +488,6 @@ function esbuildScanPlugin(
           config.optimizeDeps?.esbuildOptions?.loader?.[`.${ext}`] ||
           (ext as Loader)
 
-        if (contents.includes('import.meta.glob')) {
-          return transformGlob(
-            contents,
-            id,
-            config.root,
-            loader,
-            resolve,
-            config.logger
-          ).then((contents) => ({
-            loader,
-            contents
-          }))
-        }
-
         return {
           loader,
           contents
@@ -490,43 +495,6 @@ function esbuildScanPlugin(
       })
     }
   }
-}
-
-async function transformGlob(
-  source: string,
-  importer: string,
-  root: string,
-  loader: Loader,
-  resolve: (url: string, importer?: string) => Promise<string | undefined>,
-  logger: Logger
-) {
-  // transform the content first since es-module-lexer can't handle non-js
-  if (loader !== 'js') {
-    source = (await transform(source, { loader })).code
-  }
-
-  await init
-  const imports = parse(source)[0]
-  const s = new MagicString(source)
-  for (let index = 0; index < imports.length; index++) {
-    const { s: start, e: end, ss: expStart } = imports[index]
-    const url = source.slice(start, end)
-    if (url !== 'import.meta') continue
-    if (source.slice(end, end + 5) !== '.glob') continue
-    const { importsString, exp, endIndex } = await transformImportGlob(
-      source,
-      start,
-      normalizePath(importer),
-      index,
-      root,
-      logger,
-      undefined,
-      resolve
-    )
-    s.prepend(importsString)
-    s.overwrite(expStart, endIndex, exp, { contentOnly: true })
-  }
-  return s.toString()
 }
 
 /**

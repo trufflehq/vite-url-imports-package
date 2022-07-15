@@ -1,25 +1,53 @@
-import fs from 'fs'
-import os from 'os'
-import path from 'path'
-import { promisify } from 'util'
-import { URL, pathToFileURL } from 'url'
-import { builtinModules } from 'module'
-import { performance } from 'perf_hooks'
-import { URLSearchParams, parse as parseUrl } from 'url'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { createHash } from 'node:crypto'
+import { promisify } from 'node:util'
+import { URL, URLSearchParams, pathToFileURL } from 'node:url'
+import { builtinModules, createRequire } from 'node:module'
+import { promises as dns } from 'node:dns'
+import { performance } from 'node:perf_hooks'
+import type { AddressInfo, Server } from 'node:net'
 import resolve from 'resolve'
 import type { FSWatcher } from 'chokidar'
 import remapping from '@ampproject/remapping'
 import type { DecodedSourceMap, RawSourceMap } from '@ampproject/remapping'
 import colors from 'picocolors'
 import debug from 'debug'
+import type { Alias, AliasOptions } from 'types/alias'
+import type MagicString from 'magic-string'
+
+import type { TransformResult } from 'rollup'
+import { createFilter as _createFilter } from '@rollup/pluginutils'
 import {
   CLIENT_ENTRY,
   CLIENT_PUBLIC_PATH,
   DEFAULT_EXTENSIONS,
   ENV_PUBLIC_PATH,
   FS_PREFIX,
-  VALID_ID_PREFIX
+  OPTIMIZABLE_ENTRY_RE,
+  VALID_ID_PREFIX,
+  loopbackHosts,
+  wildcardHosts
 } from './constants'
+import type { DepOptimizationConfig } from './optimizer'
+import type { ResolvedConfig } from './config'
+import type { ResolvedServerUrls } from './server'
+import type { CommonServerOptions } from '.'
+
+/**
+ * Inlined to keep `@rollup/pluginutils` in devDependencies
+ */
+export type FilterPattern =
+  | ReadonlyArray<string | RegExp>
+  | string
+  | RegExp
+  | null
+export const createFilter = _createFilter as (
+  include?: FilterPattern,
+  exclude?: FilterPattern,
+  options?: { resolve?: string | false | null }
+) => (id: string | unknown) => boolean
 
 export function slash(p: string): string {
   return p.replace(/\\/g, '/')
@@ -32,7 +60,10 @@ export function unwrapId(id: string): string {
 }
 
 export const flattenId = (id: string): string =>
-  id.replace(/(\s*>\s*)/g, '__').replace(/[\/\.:]/g, '_')
+  id
+    .replace(/[\/:]/g, '_')
+    .replace(/[\.]/g, '__')
+    .replace(/(\s*>\s*)/g, '___')
 
 export const normalizeId = (id: string): string =>
   id.replace(/(\s*>\s*)/g, ' > ')
@@ -66,12 +97,27 @@ export function moduleListContains(
   return moduleList?.some((m) => m === id || id.startsWith(m + '/'))
 }
 
+export function isOptimizable(
+  id: string,
+  optimizeDeps: DepOptimizationConfig
+): boolean {
+  const { extensions } = optimizeDeps
+  return (
+    OPTIMIZABLE_ENTRY_RE.test(id) ||
+    (extensions?.some((ext) => id.endsWith(ext)) ?? false)
+  )
+}
+
 export const bareImportRE = /^[\w@](?!.*:\/\/)/
 export const deepImportRE = /^([^@][^/]*)\/|^(@[^/]+\/[^/]+)\//
 
 export let isRunningWithYarnPnp: boolean
+
+// TODO: use import()
+const _require = createRequire(import.meta.url)
+
 try {
-  isRunningWithYarnPnp = Boolean(require('pnpapi'))
+  isRunningWithYarnPnp = Boolean(_require('pnpapi'))
 } catch {}
 
 const ssrExtensions = ['.js', '.cjs', '.json', '.node']
@@ -229,10 +275,10 @@ export const isJSRequest = (url: string): boolean => {
 
 const knownTsRE = /\.(ts|mts|cts|tsx)$/
 const knownTsOutputRE = /\.(js|mjs|cjs|jsx)$/
-export const isTsRequest = (url: string) => knownTsRE.test(url)
-export const isPossibleTsOutput = (url: string) =>
+export const isTsRequest = (url: string): boolean => knownTsRE.test(url)
+export const isPossibleTsOutput = (url: string): boolean =>
   knownTsOutputRE.test(cleanUrl(url))
-export function getPotentialTsSrcPaths(filePath: string) {
+export function getPotentialTsSrcPaths(filePath: string): string[] {
   const [name, type, query = ''] = filePath.split(/(\.(?:[cm]?js|jsx))(\?.*)?$/)
   const paths = [name + type.replace('js', 'ts') + query]
   if (!type.endsWith('x')) {
@@ -440,7 +486,7 @@ export function generateCodeFrame(
         const lineLength = lines[j].length
         if (j === i) {
           // push underline
-          const pad = start - (count - lineLength) + 1
+          const pad = Math.max(start - (count - lineLength) + 1, 0)
           const length = Math.max(
             1,
             end > count ? lineLength - pad : end - start
@@ -472,7 +518,7 @@ export function writeFile(
 }
 
 /**
- * Use instead of fs.existsSync(filename)
+ * Use fs.statSync(filename) instead of fs.existsSync(filename)
  * #2051 if we don't have read permission on a directory, existsSync() still
  * works and will result in massively slow subsequent checks (which are
  * unnecessary in the first place)
@@ -495,14 +541,7 @@ export function emptyDir(dir: string, skip?: string[]): void {
     if (skip?.includes(file)) {
       continue
     }
-    const abs = path.resolve(dir, file)
-    // baseline is Node 12 so can't use rmSync :(
-    if (fs.lstatSync(abs).isDirectory()) {
-      emptyDir(abs)
-      fs.rmdirSync(abs)
-    } else {
-      fs.unlinkSync(abs)
-    }
+    fs.rmSync(path.resolve(dir, file), { recursive: true, force: true })
   }
 }
 
@@ -523,16 +562,11 @@ export function copyDir(srcDir: string, destDir: string): void {
   }
 }
 
-export function removeDirSync(dir: string) {
-  if (fs.existsSync(dir)) {
-    const rmSync = fs.rmSync ?? fs.rmdirSync // TODO: Remove after support for Node 12 is dropped
-    rmSync(dir, { recursive: true })
-  }
-}
-
 export const removeDir = isWindows
   ? promisify(gracefulRemoveDir)
-  : removeDirSync
+  : function removeDirSync(dir: string) {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
 export const renameDir = isWindows ? promisify(gracefulRename) : fs.renameSync
 
 export function ensureWatchedFile(
@@ -559,11 +593,16 @@ interface ImageCandidate {
 }
 const escapedSpaceCharacters = /( |\\t|\\n|\\f|\\r)+/g
 const imageSetUrlRE = /^(?:[\w\-]+\(.*?\)|'.*?'|".*?"|\S*)/
-export async function processSrcSet(
-  srcs: string,
-  replacer: (arg: ImageCandidate) => Promise<string>
-): Promise<string> {
-  const imageCandidates: ImageCandidate[] = splitSrcSet(srcs)
+function reduceSrcset(ret: { url: string; descriptor: string }[]) {
+  return ret.reduce((prev, { url, descriptor }, index) => {
+    descriptor ??= ''
+    return (prev +=
+      url + ` ${descriptor}${index === ret.length - 1 ? '' : ', '}`)
+  }, '')
+}
+
+function splitSrcSetDescriptor(srcs: string): ImageCandidate[] {
+  return splitSrcSet(srcs)
     .map((s) => {
       const src = s.replace(escapedSpaceCharacters, ' ').trim()
       const [url] = imageSetUrlRE.exec(src) || []
@@ -574,21 +613,30 @@ export async function processSrcSet(
       }
     })
     .filter(({ url }) => !!url)
+}
 
-  const ret = await Promise.all(
-    imageCandidates.map(async ({ url, descriptor }) => {
-      return {
-        url: await replacer({ url, descriptor }),
-        descriptor
-      }
-    })
+export function processSrcSet(
+  srcs: string,
+  replacer: (arg: ImageCandidate) => Promise<string>
+): Promise<string> {
+  return Promise.all(
+    splitSrcSetDescriptor(srcs).map(async ({ url, descriptor }) => ({
+      url: await replacer({ url, descriptor }),
+      descriptor
+    }))
+  ).then((ret) => reduceSrcset(ret))
+}
+
+export function processSrcSetSync(
+  srcs: string,
+  replacer: (arg: ImageCandidate) => string
+): string {
+  return reduceSrcset(
+    splitSrcSetDescriptor(srcs).map(({ url, descriptor }) => ({
+      url: replacer({ url, descriptor }),
+      descriptor
+    }))
   )
-
-  return ret.reduce((prev, { url, descriptor }, index) => {
-    descriptor ??= ''
-    return (prev +=
-      url + ` ${descriptor}${index === ret.length - 1 ? '' : ', '}`)
-  }, '')
 }
 
 function splitSrcSet(srcs: string) {
@@ -701,20 +749,40 @@ export function unique<T>(arr: T[]): T[] {
   return Array.from(new Set(arr))
 }
 
+/**
+ * Returns resolved localhost address when `dns.lookup` result differs from DNS
+ *
+ * `dns.lookup` result is same when defaultResultOrder is `verbatim`.
+ * Even if defaultResultOrder is `ipv4first`, `dns.lookup` result maybe same.
+ * For example, when IPv6 is not supported on that machine/network.
+ */
+export async function getLocalhostAddressIfDiffersFromDNS(): Promise<
+  string | undefined
+> {
+  const [nodeResult, dnsResult] = await Promise.all([
+    dns.lookup('localhost'),
+    dns.lookup('localhost', { verbatim: true })
+  ])
+  const isSame =
+    nodeResult.family === dnsResult.family &&
+    nodeResult.address === dnsResult.address
+  return isSame ? undefined : nodeResult.address
+}
+
 export interface Hostname {
-  // undefined sets the default behaviour of server.listen
+  /** undefined sets the default behaviour of server.listen */
   host: string | undefined
-  // resolve to localhost when possible
+  /** resolve to localhost when possible */
   name: string
 }
 
-export function resolveHostname(
+export async function resolveHostname(
   optionsHost: string | boolean | undefined
-): Hostname {
+): Promise<Hostname> {
   let host: string | undefined
   if (optionsHost === undefined || optionsHost === false) {
     // Use a secure default
-    host = '127.0.0.1'
+    host = 'localhost'
   } else if (optionsHost === true) {
     // If passed --host in the CLI without arguments
     host = undefined // undefined typically means 0.0.0.0 or :: (listen on all IPs)
@@ -722,16 +790,71 @@ export function resolveHostname(
     host = optionsHost
   }
 
-  // Set host name to localhost when possible, unless the user explicitly asked for '127.0.0.1'
-  const name =
-    (optionsHost !== '127.0.0.1' && host === '127.0.0.1') ||
-    host === '0.0.0.0' ||
-    host === '::' ||
-    host === undefined
-      ? 'localhost'
-      : host
+  // Set host name to localhost when possible
+  let name = host === undefined || wildcardHosts.has(host) ? 'localhost' : host
+
+  if (host === 'localhost') {
+    // See #8647 for more details.
+    const localhostAddr = await getLocalhostAddressIfDiffersFromDNS()
+    if (localhostAddr) {
+      name = localhostAddr
+    }
+  }
 
   return { host, name }
+}
+
+export async function resolveServerUrls(
+  server: Server,
+  options: CommonServerOptions,
+  config: ResolvedConfig
+): Promise<ResolvedServerUrls> {
+  const address = server.address()
+
+  const isAddressInfo = (x: any): x is AddressInfo => x?.address
+  if (!isAddressInfo(address)) {
+    return { local: [], network: [] }
+  }
+
+  const local: string[] = []
+  const network: string[] = []
+  const hostname = await resolveHostname(options.host)
+  const protocol = options.https ? 'https' : 'http'
+  const port = address.port
+  const base = config.base === './' || config.base === '' ? '/' : config.base
+
+  if (hostname.host && loopbackHosts.has(hostname.host)) {
+    let hostnameName = hostname.name
+    if (
+      hostnameName === '::1' ||
+      hostnameName === '0000:0000:0000:0000:0000:0000:0000:0001'
+    ) {
+      hostnameName = `[${hostnameName}]`
+    }
+    local.push(`${protocol}://${hostnameName}:${port}${base}`)
+  } else {
+    Object.values(os.networkInterfaces())
+      .flatMap((nInterface) => nInterface ?? [])
+      .filter(
+        (detail) =>
+          detail &&
+          detail.address &&
+          // Node < v18
+          ((typeof detail.family === 'string' && detail.family === 'IPv4') ||
+            // Node >= v18
+            (typeof detail.family === 'number' && detail.family === 4))
+      )
+      .forEach((detail) => {
+        const host = detail.address.replace('127.0.0.1', hostname.name)
+        const url = `${protocol}://${host}:${port}${base}`
+        if (detail.address.includes('127.0.0.1')) {
+          local.push(url)
+        } else {
+          network.push(url)
+        }
+      })
+  }
+  return { local, network }
 }
 
 export function arraify<T>(target: T | T[]): T[] {
@@ -744,8 +867,11 @@ export function toUpperCaseDriveLetter(pathName: string): string {
 
 export const multilineCommentsRE = /\/\*(.|[\r\n])*?\*\//gm
 export const singlelineCommentsRE = /\/\/.*/g
+export const requestQuerySplitRE = /\?(?!.*[\/|\}])/
 
+// @ts-expect-error
 export const usingDynamicImport = typeof jest === 'undefined'
+
 /**
  * Dynamically import files. It will make sure it's not being compiled away by TS/Rollup.
  *
@@ -757,17 +883,33 @@ export const usingDynamicImport = typeof jest === 'undefined'
  */
 export const dynamicImport = usingDynamicImport
   ? new Function('file', 'return import(file)')
-  : require
+  : _require
 
 export function parseRequest(id: string): Record<string, string> | null {
-  const { search } = parseUrl(id)
+  const [_, search] = id.split(requestQuerySplitRE, 2)
   if (!search) {
     return null
   }
-  return Object.fromEntries(new URLSearchParams(search.slice(1)))
+  return Object.fromEntries(new URLSearchParams(search))
 }
 
-export const blankReplacer = (match: string) => ' '.repeat(match.length)
+export const blankReplacer = (match: string): string => ' '.repeat(match.length)
+
+export function getHash(text: Buffer | string): string {
+  return createHash('sha256').update(text).digest('hex').substring(0, 8)
+}
+
+export const requireResolveFromRootWithFallback = (
+  root: string,
+  id: string
+): string => {
+  // Search in the root directory first, and fallback to the default require paths.
+  const fallbackPaths = _require.resolve.paths?.(id) || []
+  const path = _require.resolve(id, {
+    paths: [root, ...fallbackPaths]
+  })
+  return path
+}
 
 // Based on node-graceful-fs
 
@@ -812,10 +954,9 @@ function gracefulRemoveDir(
   dir: string,
   cb: (error: NodeJS.ErrnoException | null) => void
 ) {
-  const rmdir = fs.rm ?? fs.rmdir // TODO: Remove after support for Node 12 is dropped
   const start = Date.now()
   let backoff = 0
-  rmdir(dir, { recursive: true }, function CB(er) {
+  fs.rm(dir, { recursive: true }, function CB(er) {
     if (er) {
       if (
         (er.code === 'ENOTEMPTY' ||
@@ -824,7 +965,7 @@ function gracefulRemoveDir(
         Date.now() - start < GRACEFUL_REMOVE_DIR_TIMEOUT
       ) {
         setTimeout(function () {
-          rmdir(dir, { recursive: true }, CB)
+          fs.rm(dir, { recursive: true }, CB)
         }, backoff)
         if (backoff < 100) backoff += 10
         return
@@ -839,6 +980,163 @@ function gracefulRemoveDir(
   })
 }
 
-export function emptyCssComments(raw: string) {
+export function emptyCssComments(raw: string): string {
   return raw.replace(multilineCommentsRE, (s) => ' '.repeat(s.length))
+}
+
+function mergeConfigRecursively(
+  defaults: Record<string, any>,
+  overrides: Record<string, any>,
+  rootPath: string
+) {
+  const merged: Record<string, any> = { ...defaults }
+  for (const key in overrides) {
+    const value = overrides[key]
+    if (value == null) {
+      continue
+    }
+
+    const existing = merged[key]
+
+    if (existing == null) {
+      merged[key] = value
+      continue
+    }
+
+    // fields that require special handling
+    if (key === 'alias' && (rootPath === 'resolve' || rootPath === '')) {
+      merged[key] = mergeAlias(existing, value)
+      continue
+    } else if (key === 'assetsInclude' && rootPath === '') {
+      merged[key] = [].concat(existing, value)
+      continue
+    } else if (
+      key === 'noExternal' &&
+      rootPath === 'ssr' &&
+      (existing === true || value === true)
+    ) {
+      merged[key] = true
+      continue
+    }
+
+    if (Array.isArray(existing) || Array.isArray(value)) {
+      merged[key] = [...arraify(existing ?? []), ...arraify(value ?? [])]
+      continue
+    }
+    if (isObject(existing) && isObject(value)) {
+      merged[key] = mergeConfigRecursively(
+        existing,
+        value,
+        rootPath ? `${rootPath}.${key}` : key
+      )
+      continue
+    }
+
+    merged[key] = value
+  }
+  return merged
+}
+
+export function mergeConfig(
+  defaults: Record<string, any>,
+  overrides: Record<string, any>,
+  isRoot = true
+): Record<string, any> {
+  return mergeConfigRecursively(defaults, overrides, isRoot ? '' : '.')
+}
+
+export function mergeAlias(
+  a?: AliasOptions,
+  b?: AliasOptions
+): AliasOptions | undefined {
+  if (!a) return b
+  if (!b) return a
+  if (isObject(a) && isObject(b)) {
+    return { ...a, ...b }
+  }
+  // the order is flipped because the alias is resolved from top-down,
+  // where the later should have higher priority
+  return [...normalizeAlias(b), ...normalizeAlias(a)]
+}
+
+export function normalizeAlias(o: AliasOptions = []): Alias[] {
+  return Array.isArray(o)
+    ? o.map(normalizeSingleAlias)
+    : Object.keys(o).map((find) =>
+        normalizeSingleAlias({
+          find,
+          replacement: (o as any)[find]
+        })
+      )
+}
+
+// https://github.com/vitejs/vite/issues/1363
+// work around https://github.com/rollup/plugins/issues/759
+function normalizeSingleAlias({
+  find,
+  replacement,
+  customResolver
+}: Alias): Alias {
+  if (
+    typeof find === 'string' &&
+    find.endsWith('/') &&
+    replacement.endsWith('/')
+  ) {
+    find = find.slice(0, find.length - 1)
+    replacement = replacement.slice(0, replacement.length - 1)
+  }
+
+  const alias: Alias = {
+    find,
+    replacement
+  }
+  if (customResolver) {
+    alias.customResolver = customResolver
+  }
+  return alias
+}
+
+/**
+ * Transforms transpiled code result where line numbers aren't altered,
+ * so we can skip sourcemap generation during dev
+ */
+export function transformStableResult(
+  s: MagicString,
+  id: string,
+  config: ResolvedConfig
+): TransformResult {
+  return {
+    code: s.toString(),
+    map:
+      config.command === 'build' && config.build.sourcemap
+        ? s.generateMap({ hires: true, source: id })
+        : null
+  }
+}
+
+export async function asyncFlatten<T>(arr: T[]): Promise<T[]> {
+  do {
+    arr = (await Promise.all(arr)).flat(Infinity) as any
+  } while (arr.some((v: any) => v?.then))
+  return arr
+}
+
+// strip UTF-8 BOM
+export function stripBomTag(content: string): string {
+  if (content.charCodeAt(0) === 0xfeff) {
+    return content.slice(1)
+  }
+
+  return content
+}
+
+const windowsDrivePathPrefixRE = /^[A-Za-z]:[/\\]/
+
+/**
+ * path.isAbsolute also returns true for drive relative paths on windows (e.g. /something)
+ * this function returns false for them but true for absolute paths (e.g. C:/something)
+ */
+export const isNonDriveRelativeAbsolutePath = (p: string): boolean => {
+  if (!isWindows) return p.startsWith('/')
+  return windowsDrivePathPrefixRE.test(p)
 }

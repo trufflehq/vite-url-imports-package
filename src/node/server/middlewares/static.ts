@@ -1,9 +1,9 @@
-import path from 'path'
-import type { OutgoingHttpHeaders, ServerResponse } from 'http'
+import path from 'node:path'
+import type { OutgoingHttpHeaders, ServerResponse } from 'node:http'
 import type { Options } from 'sirv'
 import sirv from 'sirv'
 import type { Connect } from 'types/connect'
-import { isMatch } from 'micromatch'
+import micromatch from 'micromatch'
 import type { ViteDevServer } from '../..'
 import { FS_PREFIX } from '../../constants'
 import {
@@ -17,6 +17,8 @@ import {
   isWindows,
   slash
 } from '../../utils'
+
+const { isMatch } = micromatch
 
 const sirvOptions = (headers?: OutgoingHttpHeaders): Options => {
   return {
@@ -107,7 +109,7 @@ export function serveStaticMiddleware(
     }
 
     if (redirected) {
-      req.url = redirected
+      req.url = encodeURIComponent(redirected)
     }
 
     serve(req, res, next)
@@ -142,7 +144,7 @@ export function serveRawFsMiddleware(
       url = url.slice(FS_PREFIX.length)
       if (isWindows) url = url.replace(/^[A-Z]:/i, '')
 
-      req.url = url
+      req.url = encodeURIComponent(url)
       serveFromRoot(req, res, next)
     } else {
       next()

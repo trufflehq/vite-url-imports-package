@@ -1,5 +1,5 @@
-import path from 'path'
-import { pathToFileURL } from 'url'
+import path from 'node:path'
+import { pathToFileURL } from 'node:url'
 import type { ViteDevServer } from '../server'
 import {
   bareImportRE,
@@ -84,7 +84,6 @@ async function instantiateModule(
   if (mod.ssrModule) {
     return mod.ssrModule
   }
-
   const result =
     mod.ssrTransformResult ||
     (await transformRequest(url, server, { ssr: true }))
@@ -210,7 +209,7 @@ async function instantiateModule(
     )
   } catch (e) {
     mod.ssrError = e
-    if (e.stack && fixStacktrace !== false) {
+    if (e.stack && fixStacktrace) {
       const stacktrace = ssrRewriteStacktrace(e.stack, moduleGraph)
       rebindErrorStacktrace(e, stacktrace)
       server.config.logger.error(
@@ -290,6 +289,7 @@ async function nodeImport(
       importer,
       // Non-external modules can import ESM-only modules, but only outside
       // of test runs, because we use Node `require` in Jest to avoid segfault.
+      // @ts-expect-error
       typeof jest === 'undefined'
         ? { ...resolveOptions, tryEsmOnly: true }
         : resolveOptions

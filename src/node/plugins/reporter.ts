@@ -1,6 +1,6 @@
-import path from 'path'
-import { gzip } from 'zlib'
-import { promisify } from 'util'
+import path from 'node:path'
+import { gzip } from 'node:zlib'
+import { promisify } from 'node:util'
 import colors from 'picocolors'
 import type { Plugin } from 'rollup'
 import type { ResolvedConfig } from '../config'
@@ -33,11 +33,7 @@ export function buildReporterPlugin(config: ResolvedConfig): Plugin {
   }
 
   async function getCompressedSize(code: string | Uint8Array): Promise<string> {
-    if (
-      config.build.ssr ||
-      !config.build.reportCompressedSize ||
-      config.build.brotliSize === false
-    ) {
+    if (config.build.ssr || !config.build.reportCompressedSize) {
       return ''
     }
     return ` / gzip: ${(

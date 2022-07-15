@@ -1,5 +1,5 @@
-import fs from 'fs'
-import path from 'path'
+import fs from 'node:fs'
+import path from 'node:path'
 import MagicString from 'magic-string'
 import type { SourceMapInput } from 'rollup'
 import type { AttributeNode, ElementNode, TextNode } from '@vue/compiler-dom'
@@ -27,7 +27,8 @@ import {
   ensureWatchedFile,
   fsPathFromId,
   injectQuery,
-  normalizePath
+  normalizePath,
+  processSrcSetSync
 } from '../../utils'
 import type { ModuleGraph } from '../moduleGraph'
 
@@ -78,12 +79,13 @@ const processNodeUrl = (
       url = injectQuery(url, `t=${mod.lastHMRTimestamp}`)
     }
   }
+  const devBase = config.base
   if (startsWithSingleSlashRE.test(url)) {
-    // prefix with base
+    // prefix with base (dev only, base is never relative)
     s.overwrite(
       node.value!.loc.start.offset,
       node.value!.loc.end.offset,
-      `"${config.base + url.slice(1)}"`,
+      `"${devBase + url.slice(1)}"`,
       { contentOnly: true }
     )
   } else if (
@@ -92,18 +94,23 @@ const processNodeUrl = (
     originalUrl !== '/' &&
     htmlPath === '/index.html'
   ) {
+    const replacer = (url: string) =>
+      path.posix.join(
+        devBase,
+        path.posix.relative(originalUrl, devBase),
+        url.slice(1)
+      )
+
     // #3230 if some request url (localhost:3000/a/b) return to fallback html, the relative assets
     // path will add `/a/` prefix, it will caused 404.
-    // rewrite before `./index.js` -> `localhost:3000/a/index.js`.
-    // rewrite after `../index.js` -> `localhost:3000/index.js`.
+    // rewrite before `./index.js` -> `localhost:5173/a/index.js`.
+    // rewrite after `../index.js` -> `localhost:5173/index.js`.
     s.overwrite(
       node.value!.loc.start.offset,
       node.value!.loc.end.offset,
-      `"${path.posix.join(
-        path.posix.relative(originalUrl, '/'),
-        url.slice(1)
-      )}"`,
-      { contentOnly: true }
+      node.name === 'srcset'
+        ? `"${processSrcSetSync(url, ({ url }) => replacer(url))}"`
+        : `"${replacer(url)}"`
     )
   }
 }
@@ -159,7 +166,7 @@ const devHtmlHook: IndexHtmlTransformHook = async (
     // add HTML Proxy to Map
     addToHTMLProxyCache(config, proxyCacheUrl, inlineModuleIndex, { code, map })
 
-    // inline js module. convert to src="proxy"
+    // inline js module. convert to src="proxy" (dev only, base is never relative)
     const modulePath = `${proxyModuleUrl}?html-proxy&index=${inlineModuleIndex}.${ext}`
 
     // invalidate the module so the newly cached contents will be served

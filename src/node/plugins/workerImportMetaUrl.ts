@@ -1,21 +1,23 @@
-import path from 'path'
+import path from 'node:path'
 import JSON5 from 'json5'
 import MagicString from 'magic-string'
 import type { RollupError } from 'rollup'
 import { stripLiteral } from 'strip-literal'
 import type { ResolvedConfig } from '../config'
 import type { Plugin } from '../plugin'
-import { cleanUrl, injectQuery } from '../utils'
-import { parseRequest } from '../utils'
-import { ENV_ENTRY, ENV_PUBLIC_PATH } from '../constants'
-import type { ViteDevServer } from '..'
-import { workerFileToUrl } from './worker'
+import {
+  cleanUrl,
+  injectQuery,
+  normalizePath,
+  parseRequest,
+  transformStableResult
+} from '../utils'
+import { getDepsOptimizer } from '../optimizer'
+import type { WorkerType } from './worker'
+import { WORKER_FILE_ID, workerFileToUrl } from './worker'
 import { fileToUrl } from './asset'
 
-type WorkerType = 'classic' | 'module' | 'ignore'
 const ignoreFlagRE = /\/\*\s*@vite-ignore\s*\*\//
-
-const WORKER_FILE_ID = 'worker_url_file'
 
 function getWorkerType(raw: string, clean: string, i: number): WorkerType {
   function err(e: string, pos: number) {
@@ -69,47 +71,20 @@ function getWorkerType(raw: string, clean: string, i: number): WorkerType {
 
 export function workerImportMetaUrlPlugin(config: ResolvedConfig): Plugin {
   const isBuild = config.command === 'build'
-  let server: ViteDevServer
 
   return {
     name: 'vite:worker-import-meta-url',
 
-    configureServer(_server) {
-      server = _server
-    },
-
     async transform(code, id, options) {
-      const query = parseRequest(id)
-      if (query && query[WORKER_FILE_ID] != null && query['type'] != null) {
-        const workerType = query['type'] as WorkerType
-        let injectEnv = ''
-
-        if (workerType === 'classic') {
-          injectEnv = `importScripts('${ENV_PUBLIC_PATH}')\n`
-        } else if (workerType === 'module') {
-          injectEnv = `import '${ENV_PUBLIC_PATH}'\n`
-        } else if (workerType === 'ignore') {
-          if (isBuild) {
-            injectEnv = ''
-          } else if (server) {
-            // dynamic worker type we can't know how import the env
-            // so we copy /@vite/env code of server transform result into file header
-            const { moduleGraph } = server
-            const module = moduleGraph.getModuleById(ENV_ENTRY)
-            injectEnv = module?.transformResult?.code || ''
-          }
-        }
-
-        return {
-          code: injectEnv + code
-        }
-      }
-      let s: MagicString | undefined
+      const ssr = options?.ssr === true
       if (
+        !options?.ssr &&
         (code.includes('new Worker') || code.includes('new SharedWorker')) &&
         code.includes('new URL') &&
         code.includes(`import.meta.url`)
       ) {
+        const query = parseRequest(id)
+        let s: MagicString | undefined
         const cleanString = stripLiteral(code)
         const workerImportMetaUrlRE =
           /\bnew\s+(Worker|SharedWorker)\s*\(\s*(new\s+URL\s*\(\s*('[^']+'|"[^"]+"|`[^`]+`)\s*,\s*import\.meta\.url\s*\))/g
@@ -122,13 +97,6 @@ export function workerImportMetaUrlPlugin(config: ResolvedConfig): Plugin {
           const urlStart = cleanString.indexOf(emptyUrl, index)
           const urlEnd = urlStart + emptyUrl.length
           const rawUrl = code.slice(urlStart, urlEnd)
-
-          if (options?.ssr) {
-            this.error(
-              `\`new URL(url, import.meta.url)\` is not supported in SSR.`,
-              urlIndex
-            )
-          }
 
           // potential dynamic template string
           if (rawUrl[0] === '`' && /\$\{/.test(rawUrl)) {
@@ -144,10 +112,14 @@ export function workerImportMetaUrlPlugin(config: ResolvedConfig): Plugin {
             cleanString,
             index + allExp.length
           )
-          const file = path.resolve(path.dirname(id), rawUrl.slice(1, -1))
+          const file = normalizePath(
+            path.resolve(path.dirname(id), rawUrl.slice(1, -1))
+          )
+
           let url: string
           if (isBuild) {
-            url = await workerFileToUrl(this, config, file, query)
+            getDepsOptimizer(config, ssr)?.registerWorkersSource(id)
+            url = await workerFileToUrl(config, file, query)
           } else {
             url = await fileToUrl(cleanUrl(file), config, this)
             url = injectQuery(url, WORKER_FILE_ID)
@@ -159,10 +131,7 @@ export function workerImportMetaUrlPlugin(config: ResolvedConfig): Plugin {
         }
 
         if (s) {
-          return {
-            code: s.toString(),
-            map: config.build.sourcemap ? s.generateMap({ hires: true }) : null
-          }
+          return transformStableResult(s, id, config)
         }
 
         return null

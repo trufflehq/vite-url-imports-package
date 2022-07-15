@@ -29,10 +29,12 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 */
 
-import fs from 'fs'
-import { join, resolve } from 'path'
-import { performance } from 'perf_hooks'
+import fs from 'node:fs'
+import { join, resolve } from 'node:path'
+import { performance } from 'node:perf_hooks'
+import { createRequire } from 'node:module'
 import type {
+  CustomPluginOptions,
   EmittedFile,
   InputOptions,
   LoadResult,
@@ -56,8 +58,10 @@ import type { FSWatcher } from 'chokidar'
 import colors from 'picocolors'
 import type * as postcss from 'postcss'
 import type { Plugin } from '../plugin'
-import { cleanUrl, combineSourcemaps } from '../utils'
 import {
+  arraify,
+  cleanUrl,
+  combineSourcemaps,
   createDebugger,
   ensureWatchedFile,
   generateCodeFrame,
@@ -88,12 +92,14 @@ export interface PluginContainer {
     id: string,
     importer?: string,
     options?: {
+      custom?: CustomPluginOptions
       skip?: Set<Plugin>
       ssr?: boolean
       /**
        * @internal
        */
       scan?: boolean
+      isEntry?: boolean
     }
   ): Promise<PartialResolvedId | null>
   transform(
@@ -145,13 +151,28 @@ export async function createPluginContainer(
   const debugPluginTransform = createDebugger('vite:plugin-transform', {
     onlyWhenFocused: 'vite:plugin'
   })
+  const debugSourcemapCombineFlag = 'vite:sourcemap-combine'
+  const isDebugSourcemapCombineFocused = process.env.DEBUG?.includes(
+    debugSourcemapCombineFlag
+  )
+  const debugSourcemapCombineFilter =
+    process.env.DEBUG_VITE_SOURCEMAP_COMBINE_FILTER
+  const debugSourcemapCombine = createDebugger('vite:sourcemap-combine', {
+    onlyWhenFocused: true
+  })
 
   // ---------------------------------------------------------------------------
 
   const watchFiles = new Set<string>()
 
+  // TODO: use import()
+  const _require = createRequire(import.meta.url)
+
   // get rollup version
-  const rollupPkgPath = resolve(require.resolve('rollup'), '../../package.json')
+  const rollupPkgPath = resolve(
+    _require.resolve('rollup'),
+    '../../package.json'
+  )
   const minimalContext: MinimalPluginContext = {
     meta: {
       rollupVersion: JSON.parse(fs.readFileSync(rollupPkgPath, 'utf-8'))
@@ -239,7 +260,11 @@ export async function createPluginContainer(
     async resolve(
       id: string,
       importer?: string,
-      options?: { skipSelf?: boolean }
+      options?: {
+        custom?: CustomPluginOptions
+        isEntry?: boolean
+        skipSelf?: boolean
+      }
     ) {
       let skip: Set<Plugin> | undefined
       if (options?.skipSelf && this._activePlugin) {
@@ -247,6 +272,8 @@ export async function createPluginContainer(
         skip.add(this._activePlugin)
       }
       let out = await container.resolveId(id, importer, {
+        custom: options?.custom,
+        isEntry: !!options?.isEntry,
         skip,
         ssr: this.ssr,
         scan: this._scan
@@ -416,6 +443,16 @@ export async function createPluginContainer(
     }
 
     _getCombinedSourcemap(createIfNull = false) {
+      if (
+        debugSourcemapCombineFilter &&
+        this.filename.includes(debugSourcemapCombineFilter)
+      ) {
+        debugSourcemapCombine('----------', this.filename)
+        debugSourcemapCombine(this.combinedMap)
+        debugSourcemapCombine(this.sourcemapChain)
+        debugSourcemapCombine('----------')
+      }
+
       let combinedMap = this.combinedMap
       for (let m of this.sourcemapChain) {
         if (typeof m === 'string') m = JSON.parse(m)
@@ -469,7 +506,9 @@ export async function createPluginContainer(
           (await plugin.options.call(minimalContext, options)) || options
       }
       if (options.acornInjectPlugins) {
-        parser = acorn.Parser.extend(options.acornInjectPlugins as any)
+        parser = acorn.Parser.extend(
+          ...(arraify(options.acornInjectPlugins) as any)
+        )
       }
       return {
         acorn,
@@ -516,7 +555,12 @@ export async function createPluginContainer(
           ctx as any,
           rawId,
           importer,
-          { ssr, scan }
+          {
+            custom: options?.custom,
+            isEntry: !!options?.isEntry,
+            ssr,
+            scan
+          }
         )
         if (!result) continue
 
@@ -605,6 +649,10 @@ export async function createPluginContainer(
           if (result.code !== undefined) {
             code = result.code
             if (result.map) {
+              if (isDebugSourcemapCombineFocused) {
+                // @ts-expect-error inject plugin name for debug purpose
+                result.map.name = plugin.name
+              }
               ctx.sourcemapChain.push(result.map)
             }
           }

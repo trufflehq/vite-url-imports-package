@@ -1,8 +1,8 @@
-import type { Server } from 'http'
-import { STATUS_CODES } from 'http'
-import type { ServerOptions as HttpsServerOptions } from 'https'
-import { createServer as createHttpsServer } from 'https'
-import type { Socket } from 'net'
+import type { Server } from 'node:http'
+import { STATUS_CODES } from 'node:http'
+import type { ServerOptions as HttpsServerOptions } from 'node:https'
+import { createServer as createHttpsServer } from 'node:https'
+import type { Socket } from 'node:net'
 import colors from 'picocolors'
 import type { ServerOptions, WebSocket as WebSocketRaw } from 'ws'
 import { WebSocketServer as WebSocketServerRaw } from 'ws'
@@ -160,7 +160,12 @@ export function createWebSocketServer(
   })
 
   wss.on('error', (e: Error & { code: string }) => {
-    if (e.code !== 'EADDRINUSE') {
+    if (e.code === 'EADDRINUSE') {
+      config.logger.error(
+        colors.red(`WebSocket server error: Port is already in use`),
+        { error: e }
+      )
+    } else {
       config.logger.error(
         colors.red(`WebSocket server error:\n${e.stack || e.message}`),
         { error: e }

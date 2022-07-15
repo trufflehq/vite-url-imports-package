@@ -8,15 +8,24 @@ import type {
   Node as _Node
 } from 'estree'
 import { extract_names as extractNames } from 'periscopic'
+// `eslint-plugin-node` doesn't support package without main
+// eslint-disable-next-line node/no-missing-import
 import { walk as eswalk } from 'estree-walker'
 import type { RawSourceMap } from '@ampproject/remapping'
-import { combineSourcemaps } from '../utils'
-import { parser } from '../server/pluginContainer'
 import type { TransformResult } from '../server/transformRequest'
+import { parser } from '../server/pluginContainer'
+import { combineSourcemaps } from '../utils'
+import { isJSONRequest } from '../plugins/json'
 
 type Node = _Node & {
   start: number
   end: number
+}
+
+interface TransformOptions {
+  json?: {
+    stringify?: boolean
+  }
 }
 
 export const ssrModuleExportsKey = `__vite_ssr_exports__`
@@ -28,7 +37,33 @@ export const ssrImportMetaKey = `__vite_ssr_import_meta__`
 export async function ssrTransform(
   code: string,
   inMap: SourceMap | null,
-  url: string
+  url: string,
+  originalCode: string,
+  options?: TransformOptions
+): Promise<TransformResult | null> {
+  if (options?.json?.stringify && isJSONRequest(url)) {
+    return ssrTransformJSON(code, inMap)
+  }
+  return ssrTransformScript(code, inMap, url, originalCode)
+}
+
+async function ssrTransformJSON(
+  code: string,
+  inMap: SourceMap | null
+): Promise<TransformResult> {
+  return {
+    code: code.replace('export default', `${ssrModuleExportsKey}.default =`),
+    map: inMap,
+    deps: [],
+    dynamicDeps: []
+  }
+}
+
+async function ssrTransformScript(
+  code: string,
+  inMap: SourceMap | null,
+  url: string,
+  originalCode: string
 ): Promise<TransformResult | null> {
   const s = new MagicString(code)
 
@@ -157,7 +192,7 @@ export async function ssrTransform(
         s.remove(node.start, node.start + 15 /* 'export default '.length */)
         s.append(
           `\nObject.defineProperty(${ssrModuleExportsKey}, "default", ` +
-            `{ enumerable: true, value: ${name} });`
+            `{ enumerable: true, configurable: true, value: ${name} });`
         )
       } else {
         // anonymous default exports
@@ -232,17 +267,23 @@ export async function ssrTransform(
 
   let map = s.generateMap({ hires: true })
   if (inMap && inMap.mappings && inMap.sources.length > 0) {
-    map = combineSourcemaps(url, [
-      {
-        ...map,
-        sources: inMap.sources,
-        sourcesContent: inMap.sourcesContent
-      } as RawSourceMap,
-      inMap as RawSourceMap
-    ]) as SourceMap
+    map = combineSourcemaps(
+      url,
+      [
+        {
+          ...map,
+          sources: inMap.sources,
+          sourcesContent: inMap.sourcesContent
+        } as RawSourceMap,
+        inMap as RawSourceMap
+      ],
+      false
+    ) as SourceMap
   } else {
     map.sources = [url]
-    map.sourcesContent = [code]
+    // needs to use originalCode instead of code
+    // because code might be already transformed even if map is null
+    map.sourcesContent = [originalCode]
   }
 
   return {
